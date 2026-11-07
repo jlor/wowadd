@@ -1,0 +1,445 @@
+#!/usr/bin/env bash
+# wowadd - install and update WoW addons from CurseForge and GitHub releases.
+#
+# CurseForge's slug search and project pages sit behind Cloudflare and answer 403
+# to anything that isn't a browser, so a slug cannot be resolved on its own. The
+# per-project file endpoints are open though, which is all we need once the
+# numeric project id is known. Pass it once with --project-id and it's remembered;
+# set CURSEFORGE_API_KEY to have slugs resolved automatically instead.
+
+set -euo pipefail
+
+VERSION="0.1.0"
+UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+
+# ---------------------------------------------------------------- config
+
+CONFIG="${WOWADD_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/wowadd/config}"
+
+ADDONS_DIR="${WOWADD_ADDONS_DIR:-}"
+GAME_VERSION="${WOWADD_GAME_VERSION:-}"
+GAME_INTERFACE="${WOWADD_GAME_INTERFACE:-}"
+BACKUP_DIR="${WOWADD_BACKUP_DIR:-}"
+CURSEFORGE_API_KEY="${CURSEFORGE_API_KEY:-}"
+
+# shellcheck disable=SC1090
+[ -f "$CONFIG" ] && . "$CONFIG"
+
+: "${GAME_VERSION:=1.60.1}"
+: "${GAME_INTERFACE:=16001}"
+: "${BACKUP_DIR:=$HOME/wow-backups}"
+
+MANIFEST=""   # set once ADDONS_DIR is known
+
+# ---------------------------------------------------------------- output
+
+if [ -t 1 ]; then
+	C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_YEL=$'\033[33m'; C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
+else
+	C_RED=""; C_GRN=""; C_YEL=""; C_DIM=""; C_OFF=""
+fi
+
+info() { printf '%s\n' "$*"; }
+step() { printf '  %s\n' "$*"; }
+ok()   { printf '  %s%s%s\n' "$C_GRN" "$*" "$C_OFF"; }
+warn() { printf '  %s%s%s\n' "$C_YEL" "$*" "$C_OFF" >&2; }
+die()  { printf '%serror:%s %s\n' "$C_RED" "$C_OFF" "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------- setup
+
+need() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
+
+init() {
+	need curl; need jq; need unzip; need tar
+
+	[ -n "$ADDONS_DIR" ] || die "ADDONS_DIR is not set. Run: wowadd config-init /path/to/Interface/AddOns"
+	[ -d "$ADDONS_DIR" ] || die "ADDONS_DIR does not exist: $ADDONS_DIR"
+
+	MANIFEST="$ADDONS_DIR/.wowadd.json"
+	[ -f "$MANIFEST" ] || printf '{"version":1,"addons":{}}\n' > "$MANIFEST"
+	mkdir -p "$BACKUP_DIR"
+}
+
+# ---------------------------------------------------------------- manifest
+
+mf_get()  { jq -r --arg k "$1" '.addons[$k] // empty' "$MANIFEST"; }
+mf_keys() { jq -r '.addons | keys[]' "$MANIFEST"; }
+
+mf_put() { # name json
+	local tmp; tmp=$(mktemp)
+	jq --arg k "$1" --argjson v "$2" '.addons[$k] = $v' "$MANIFEST" > "$tmp" && mv "$tmp" "$MANIFEST"
+}
+
+# ---------------------------------------------------------------- curseforge
+
+cf_files() { # projectId -> files json array
+	local id=$1 out
+	out=$(curl -fsS -A "$UA" "https://www.curseforge.com/api/v1/mods/$id/files?pageSize=50" 2>/dev/null) \
+		|| die "could not list files for project $id (network, or the project id is wrong)"
+	jq -e '.data' <<<"$out" >/dev/null 2>&1 || die "unexpected response listing files for project $id"
+	jq '.data' <<<"$out"
+}
+
+cf_pick() { # files-json [allow_alpha] -> one file object matching GAME_VERSION
+	local files=$1 maxtype=${2:-2}
+	jq -e --arg gv "$GAME_VERSION" --argjson mt "$maxtype" '
+		[ .[] | select(.gameVersions | index($gv)) | select(.releaseType <= $mt) ]
+		| sort_by(.id) | last // empty
+	' <<<"$files"
+}
+
+cf_resolve_slug() { # slug -> projectId, needs an API key
+	[ -n "$CURSEFORGE_API_KEY" ] || return 1
+	curl -fsS -H "x-api-key: $CURSEFORGE_API_KEY" \
+		"https://api.curseforge.com/v1/mods/search?gameId=1&slug=$1" 2>/dev/null \
+		| jq -r '.data[0].id // empty'
+}
+
+# ---------------------------------------------------------------- github
+
+gh_release() { # owner/repo [tag] -> release json
+	local repo=$1 tag=${2:-}
+	local url="https://api.github.com/repos/$repo/releases/latest"
+	[ -n "$tag" ] && url="https://api.github.com/repos/$repo/releases/tags/$tag"
+	curl -fsS "$url" 2>/dev/null || die "no such GitHub release: $repo${tag:+ @ $tag}"
+}
+
+gh_asset() { # release-json -> download url of the addon zip
+	jq -r '[.assets[] | select(.name | endswith(".zip"))] | first | .browser_download_url // empty' <<<"$1"
+}
+
+# ---------------------------------------------------------------- install
+
+# Download, verify and stage an archive. Echoes the staging directory.
+stage() { # url -> dir
+	local url=$1 dir zip
+	dir=$(mktemp -d); zip="$dir/a.zip"
+
+	curl -fsSL -A "$UA" -o "$zip" "$url" || die "download failed: $url"
+	[ -s "$zip" ] || die "downloaded an empty file"
+
+	# Refuse anything that could write outside the AddOns directory.
+	if unzip -Z1 "$zip" | grep -qE '^/|\.\.'; then
+		rm -rf "$dir"; die "archive contains absolute or traversing paths - refusing"
+	fi
+	if unzip -Z1 "$zip" | grep -qiE '\.(exe|dll|so|dylib)$'; then
+		rm -rf "$dir"; die "archive contains executables - refusing"
+	fi
+
+	mkdir -p "$dir/x"
+	unzip -q "$zip" -d "$dir/x" || die "could not extract archive"
+	printf '%s\n' "$dir"
+}
+
+# Top-level directories in a staging dir that actually look like addons.
+staged_folders() { # stagedir
+	local d=$1 f
+	for f in "$d/x"/*/; do
+		[ -d "$f" ] || continue
+		printf '%s\n' "$(basename "$f")"
+	done
+}
+
+toc_interface() { # addon-dir -> interface list, preferring a _Forever toc
+	local d=$1 t
+	t=$(find "$d" -maxdepth 1 -name '*_Forever.toc' 2>/dev/null | head -1)
+	[ -n "$t" ] || t=$(find "$d" -maxdepth 1 -name '*.toc' 2>/dev/null | head -1)
+	[ -n "$t" ] || return 0
+	grep -m1 '^## Interface:' "$t" 2>/dev/null | cut -d: -f2- | tr -d ' \r'
+}
+
+toc_version() { # addon-dir -> version string
+	local d=$1 t
+	t=$(find "$d" -maxdepth 1 -name '*_Forever.toc' 2>/dev/null | head -1)
+	[ -n "$t" ] || t=$(find "$d" -maxdepth 1 -name '*.toc' 2>/dev/null | head -1)
+	[ -n "$t" ] || return 0
+	grep -m1 '^## Version:' "$t" 2>/dev/null | cut -d: -f2- | tr -d ' \r'
+}
+
+backup_folders() { # name folders...
+	local name=$1; shift
+	local present=() f
+	for f in "$@"; do [ -d "$ADDONS_DIR/$f" ] && present+=("$f"); done
+	[ ${#present[@]} -gt 0 ] || return 0
+
+	local out="$BACKUP_DIR/$name-$(date +%Y%m%d-%H%M%S).tar.gz"
+	tar -czf "$out" -C "$ADDONS_DIR" "${present[@]}"
+	step "backed up ${#present[@]} folder(s) -> $out"
+}
+
+# Move staged folders into place, replacing what's there.
+commit_install() { # stagedir folders...
+	local d=$1; shift
+	local f
+	for f in "$@"; do
+		rm -rf "${ADDONS_DIR:?}/$f"
+		cp -r "$d/x/$f" "$ADDONS_DIR/"
+	done
+}
+
+do_install() {
+	local source="" file_id="" project_id="" allow_alpha=2 name=""
+
+	while [ $# -gt 0 ]; do
+		case $1 in
+			--file|--file-id) file_id=$2; shift 2 ;;
+			--project-id)     project_id=$2; shift 2 ;;
+			--alpha)          allow_alpha=3; shift ;;
+			--stable-only)    allow_alpha=1; shift ;;
+			-*) die "unknown flag: $1" ;;
+			*)  source=$1; shift ;;
+		esac
+	done
+	[ -n "$source" ] || die "usage: wowadd install <slug|github:owner/repo> [--project-id N] [--file ID]"
+
+	# Accept a full CurseForge URL and pull the slug (and file id) out of it.
+	if [[ $source == https://*curseforge.com/* ]]; then
+		[[ $source =~ /files/([0-9]+) ]] && file_id="${BASH_REMATCH[1]}"
+		source=$(sed -E 's#.*/wow/addons/([^/?]+).*#\1#' <<<"$source")
+	fi
+
+	if [[ $source == github:* || $source == gh:* ]]; then
+		install_github "${source#*:}"
+		return
+	fi
+
+	name=$source
+	# project id: explicit > remembered > resolved via API key
+	local known; known=$(mf_get "$name")
+	if [ -z "$project_id" ] && [ -n "$known" ]; then
+		project_id=$(jq -r '.projectId // empty' <<<"$known")
+	fi
+	if [ -z "$project_id" ]; then
+		project_id=$(cf_resolve_slug "$name" || true)
+	fi
+	if [ -z "$project_id" ]; then
+		die "don't know the project id for '$name'.
+  CurseForge blocks slug lookups without an API key, so pass it once:
+      wowadd install $name --project-id <id>
+  The id is on the project page under 'About Project'. It is remembered afterwards.
+  Alternatively set CURSEFORGE_API_KEY to resolve slugs automatically."
+	fi
+
+	info "installing $name (curseforge project $project_id)"
+
+	local files picked
+	files=$(cf_files "$project_id")
+	if [ -n "$file_id" ]; then
+		picked=$(jq -e --argjson f "$file_id" '.[] | select(.id == $f)' <<<"$files") \
+			|| die "file $file_id is not listed for project $project_id"
+	else
+		picked=$(cf_pick "$files" "$allow_alpha") \
+			|| die "no file for game version $GAME_VERSION in project $project_id"
+	fi
+
+	local fid fname fver
+	fid=$(jq -r '.id' <<<"$picked")
+	fname=$(jq -r '.fileName' <<<"$picked")
+	fver=$(jq -r '.displayName' <<<"$picked")
+	step "file $fid - $fname ($fver)"
+
+	local dir; dir=$(stage "https://www.curseforge.com/api/v1/mods/$project_id/files/$fid/download")
+	finish_install "$name" "$dir" "curseforge" \
+		"$(jq -n --argjson p "$project_id" --argjson f "$fid" --arg n "$fname" --arg v "$fver" \
+			'{source:"curseforge", projectId:$p, fileId:$f, fileName:$n, version:$v}')"
+}
+
+install_github() { # owner/repo[@tag]
+	local spec=$1 repo tag="" name
+	repo=${spec%@*}
+	[[ $spec == *@* ]] && tag=${spec#*@}
+	name=$(basename "$repo")
+
+	info "installing $name (github $repo${tag:+ @ $tag})"
+
+	local rel url ver
+	rel=$(gh_release "$repo" "$tag")
+	url=$(gh_asset "$rel")
+	[ -n "$url" ] || die "no .zip asset on that release"
+	ver=$(jq -r '.tag_name' <<<"$rel")
+	step "release $ver - $(basename "$url")"
+
+	local dir; dir=$(stage "$url")
+	finish_install "$name" "$dir" "github" \
+		"$(jq -n --arg r "$repo" --arg v "$ver" --arg u "$url" \
+			'{source:"github", repo:$r, version:$v, asset:$u}')"
+}
+
+finish_install() { # name stagedir kind meta-json
+	local name=$1 dir=$2 _kind=$3 meta=$4
+
+	local folders=(); while IFS= read -r f; do folders+=("$f"); done < <(staged_folders "$dir")
+	[ ${#folders[@]} -gt 0 ] || { rm -rf "$dir"; die "archive contained no addon folders"; }
+	step "folders: ${folders[*]}"
+
+	# Warn (don't block) when the TOC doesn't claim our interface version.
+	local f iface
+	for f in "${folders[@]}"; do
+		iface=$(toc_interface "$dir/x/$f")
+		if [ -z "$iface" ]; then
+			warn "$f has no .toc - installing anyway"
+		elif ! grep -q "$GAME_INTERFACE" <<<"$iface"; then
+			warn "$f targets interface $iface, not $GAME_INTERFACE"
+		fi
+	done
+
+	backup_folders "$name" "${folders[@]}"
+	commit_install "$dir" "${folders[@]}"
+	rm -rf "$dir"
+
+	local folders_json; folders_json=$(printf '%s\n' "${folders[@]}" | jq -R . | jq -s .)
+	mf_put "$name" "$(jq -n --argjson m "$meta" --argjson f "$folders_json" --arg t "$(date -Is)" \
+		'$m + {folders:$f, installedAt:$t}')"
+
+	ok "installed $name"
+}
+
+# ---------------------------------------------------------------- list
+
+do_list() {
+	local managed=() name entry
+	printf '%-26s %-10s %-12s %-9s %s\n' NAME VERSION SOURCE INTERFACE FOLDERS
+	while IFS= read -r name; do
+		[ -n "$name" ] || continue
+		managed+=("$name")
+		entry=$(mf_get "$name")
+		local src ver first iface folders
+		src=$(jq -r '.source' <<<"$entry")
+		folders=$(jq -r '.folders | join(",")' <<<"$entry")
+		first=$(jq -r '.folders[0]' <<<"$entry")
+		ver=$(toc_version "$ADDONS_DIR/$first" 2>/dev/null || true)
+		[ -n "$ver" ] || ver=$(jq -r '.version' <<<"$entry")
+		iface=$(toc_interface "$ADDONS_DIR/$first" 2>/dev/null || true)
+		local mark=""; grep -q "$GAME_INTERFACE" <<<"$iface" || mark="$C_YEL !$C_OFF"
+		printf '%-26s %-10s %-12s %-9s %s%s\n' "$name" "${ver:- -}" "$src" "${iface:- -}" "$folders" "$mark"
+	done < <(mf_keys)
+
+	# Anything in AddOns that wowadd didn't put there.
+	local owned unmanaged=() d
+	owned=$(jq -r '.addons[].folders[]' "$MANIFEST" 2>/dev/null | sort -u)
+	for d in "$ADDONS_DIR"/*/; do
+		[ -d "$d" ] || continue
+		d=$(basename "$d")
+		grep -qxF "$d" <<<"$owned" || unmanaged+=("$d")
+	done
+	if [ ${#unmanaged[@]} -gt 0 ]; then
+		printf '\n%sunmanaged (installed by hand):%s %s\n' "$C_DIM" "$C_OFF" "${unmanaged[*]}"
+	fi
+}
+
+# ---------------------------------------------------------------- update
+
+do_update() {
+	local dry=0 targets=()
+	while [ $# -gt 0 ]; do
+		case $1 in
+			--dry-run|-n) dry=1; shift ;;
+			-*) die "unknown flag: $1" ;;
+			*) targets+=("$1"); shift ;;
+		esac
+	done
+	if [ ${#targets[@]} -eq 0 ]; then
+		while IFS= read -r n; do [ -n "$n" ] && targets+=("$n"); done < <(mf_keys)
+	fi
+	[ ${#targets[@]} -gt 0 ] || { info "nothing installed by wowadd yet"; return; }
+
+	local name entry src changed=0
+	for name in "${targets[@]}"; do
+		entry=$(mf_get "$name")
+		[ -n "$entry" ] || { warn "$name is not managed by wowadd"; continue; }
+		src=$(jq -r '.source' <<<"$entry")
+
+		case $src in
+			curseforge)
+				local pid cur files latest lid lver
+				pid=$(jq -r '.projectId' <<<"$entry")
+				cur=$(jq -r '.fileId' <<<"$entry")
+				files=$(cf_files "$pid")
+				latest=$(cf_pick "$files" 2) || { warn "$name: no file for $GAME_VERSION"; continue; }
+				lid=$(jq -r '.id' <<<"$latest"); lver=$(jq -r '.displayName' <<<"$latest")
+				if [ "$lid" = "$cur" ]; then
+					step "$name is current ($(jq -r '.version' <<<"$entry"))"
+				else
+					changed=1
+					info "$name: $(jq -r '.version' <<<"$entry") -> $lver (file $lid)"
+					[ "$dry" -eq 1 ] || do_install "$name" --file "$lid" --project-id "$pid"
+				fi
+				;;
+			github)
+				local repo cur rel lver
+				repo=$(jq -r '.repo' <<<"$entry")
+				cur=$(jq -r '.version' <<<"$entry")
+				rel=$(gh_release "$repo")
+				lver=$(jq -r '.tag_name' <<<"$rel")
+				if [ "$lver" = "$cur" ]; then
+					step "$name is current ($cur)"
+				else
+					changed=1
+					info "$name: $cur -> $lver"
+					[ "$dry" -eq 1 ] || install_github "$repo"
+				fi
+				;;
+			*) warn "$name: unknown source '$src'" ;;
+		esac
+	done
+	[ "$changed" -eq 0 ] && ok "everything up to date"
+	[ "$dry" -eq 1 ] && [ "$changed" -eq 1 ] && info "(dry run - nothing changed)"
+	return 0
+}
+
+# ---------------------------------------------------------------- config
+
+do_config_init() {
+	local dir=${1:-}
+	[ -n "$dir" ] || die "usage: wowadd config-init /path/to/Interface/AddOns"
+	[ -d "$dir" ] || die "not a directory: $dir"
+	mkdir -p "$(dirname "$CONFIG")"
+	cat > "$CONFIG" <<EOF
+# wowadd configuration
+ADDONS_DIR="$dir"
+GAME_VERSION="$GAME_VERSION"
+GAME_INTERFACE="$GAME_INTERFACE"
+BACKUP_DIR="$BACKUP_DIR"
+# Optional: lets wowadd resolve slugs without a --project-id.
+# CURSEFORGE_API_KEY=""
+EOF
+	ok "wrote $CONFIG"
+}
+
+usage() {
+	cat <<EOF
+wowadd $VERSION - install and update WoW addons
+
+  wowadd install <slug> --project-id <id>   first install from CurseForge
+  wowadd install <slug>                     id remembered from last time
+  wowadd install <curseforge-url>           slug (and file id) read from the URL
+  wowadd install <slug> --file <fileId>     a specific build, e.g. to downgrade
+  wowadd install github:owner/repo[@tag]    from GitHub releases
+  wowadd list                               what's installed, managed or not
+  wowadd update [name...] [--dry-run]       check for and apply newer builds
+  wowadd config-init <AddOns dir>           write the config file
+
+Flags for install: --stable-only (release only), --alpha (allow alpha).
+
+Config: $CONFIG
+  ADDONS_DIR, GAME_VERSION (default 1.60.1), GAME_INTERFACE (default 16001),
+  BACKUP_DIR (default ~/wow-backups), CURSEFORGE_API_KEY (optional).
+
+Note: CurseForge blocks slug lookups and project pages without an API key, so the
+numeric project id is needed once per addon. It's on the project page under
+"About Project", and wowadd remembers it afterwards.
+EOF
+}
+
+# ---------------------------------------------------------------- main
+
+cmd=${1:-}; shift || true
+case $cmd in
+	install)     init; do_install "$@" ;;
+	list|ls)     init; do_list "$@" ;;
+	update|up)   init; do_update "$@" ;;
+	config-init) do_config_init "$@" ;;
+	version|--version) printf 'wowadd %s\n' "$VERSION" ;;
+	help|--help|-h|"") usage ;;
+	*) die "unknown command: $cmd (try: wowadd help)" ;;
+esac
