@@ -4,8 +4,11 @@
 # CurseForge's slug search and project pages sit behind Cloudflare and answer 403
 # to anything that isn't a browser, so a slug cannot be resolved on its own. The
 # per-project file endpoints are open though, which is all we need once the
-# numeric project id is known. Pass it once with --project-id and it's remembered;
-# set CURSEFORGE_API_KEY to have slugs resolved automatically instead.
+# numeric project id is known. Pass it once with --project-id and it's remembered.
+#
+# CURSEFORGE_API_KEY resolves slugs (and enables `search`) only if CurseForge has
+# approved /v1/mods/search for that key - keys are approved per endpoint, and an
+# unapproved one answers 403 there while working everywhere else.
 
 set -euo pipefail
 
@@ -70,6 +73,21 @@ mf_put() { # name json
 	jq --arg k "$1" --argjson v "$2" '.addons[$k] = $v' "$MANIFEST" > "$tmp" && mv "$tmp" "$MANIFEST"
 }
 
+mf_del() { # name
+	local tmp; tmp=$(mktemp)
+	jq --arg k "$1" 'del(.addons[$k])' "$MANIFEST" > "$tmp" && mv "$tmp" "$MANIFEST"
+}
+
+# Managed addons other than $1 that also claim folder $2.
+mf_other_owners() { # name folder -> comma separated names
+	jq -r --arg k "$1" --arg f "$2" '
+		[ .addons | to_entries[]
+		  | select(.key != $k)
+		  | select((.value.folders // []) | index($f))
+		  | .key ] | join(", ")
+	' "$MANIFEST"
+}
+
 # ---------------------------------------------------------------- curseforge
 
 cf_files() { # projectId -> files json array
@@ -88,11 +106,58 @@ cf_pick() { # files-json [allow_alpha] -> one file object matching GAME_VERSION
 	' <<<"$files"
 }
 
-cf_resolve_slug() { # slug -> projectId, needs an API key
-	[ -n "$CURSEFORGE_API_KEY" ] || return 1
-	curl -fsS -H "x-api-key: $CURSEFORGE_API_KEY" \
-		"https://api.curseforge.com/v1/mods/search?gameId=1&slug=$1" 2>/dev/null \
-		| jq -r '.data[0].id // empty'
+# /v1/mods/search is approved per API key: a key can be fine for every other
+# endpoint and still answer 403 ("API Key missing or invalid") here, so say which
+# it was rather than blaming the key as a whole.
+#
+# These answer through CF_RESULT/CF_ERR rather than stdout, because a command
+# substitution would run them in a subshell and throw the diagnostic away.
+CF_RESULT=""
+CF_ERR=""
+
+cf_api_search() { # query-args... -> body in CF_RESULT, 0 on HTTP 200
+	CF_RESULT=""; CF_ERR=""
+	if [ -z "$CURSEFORGE_API_KEY" ]; then
+		CF_ERR="no CURSEFORGE_API_KEY is set"
+		return 1
+	fi
+	local args=() a out code
+	for a in "$@"; do args+=(--data-urlencode "$a"); done
+
+	out=$(curl -sS --get -H "x-api-key: $CURSEFORGE_API_KEY" -H "Accept: application/json" \
+		"${args[@]}" -w $'\n%{http_code}' \
+		"https://api.curseforge.com/v1/mods/search" 2>/dev/null) || {
+		CF_ERR="could not reach api.curseforge.com"
+		return 1
+	}
+	code=${out##*$'\n'}
+
+	case $code in
+		200) CF_RESULT=${out%$'\n'*} ;;
+		403) CF_ERR="this API key may not use /v1/mods/search (CurseForge approves that endpoint per key)"
+		     return 1 ;;
+		429) CF_ERR="rate limited by api.curseforge.com - try again shortly"
+		     return 1 ;;
+		*)   CF_ERR="api.curseforge.com answered HTTP $code"
+		     return 1 ;;
+	esac
+}
+
+cf_search() { # terms limit -> results json array in CF_RESULT
+	cf_api_search "gameId=1" "classId=1" "searchFilter=$1" \
+		"sortField=2" "sortOrder=desc" "pageSize=${2:-10}" || return 1
+	local data
+	data=$(jq -e '.data' <<<"$CF_RESULT" 2>/dev/null) || {
+		CF_ERR="unexpected response from api.curseforge.com"
+		return 1
+	}
+	CF_RESULT=$data
+}
+
+cf_resolve_slug() { # slug -> projectId in CF_RESULT, needs a key with search access
+	cf_api_search "gameId=1" "slug=$1" || return 1
+	CF_RESULT=$(jq -r '.data[0].id // empty' <<<"$CF_RESULT" 2>/dev/null)
+	[ -n "$CF_RESULT" ] || { CF_ERR="no CurseForge project has the slug '$1'"; return 1; }
 }
 
 # ---------------------------------------------------------------- github
@@ -106,6 +171,16 @@ gh_release() { # owner/repo [tag] -> release json
 
 gh_asset() { # release-json -> download url of the addon zip
 	jq -r '[.assets[] | select(.name | endswith(".zip"))] | first | .browser_download_url // empty' <<<"$1"
+}
+
+gh_search() { # terms limit -> repo search results json array
+	local auth=()
+	[ -n "${GITHUB_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
+	curl -fsS --get "${auth[@]+"${auth[@]}"}" \
+		--data-urlencode "q=$1" --data-urlencode "sort=stars" \
+		--data-urlencode "per_page=${2:-10}" \
+		"https://api.github.com/search/repositories" 2>/dev/null \
+		| jq -e '.items' 2>/dev/null
 }
 
 # ---------------------------------------------------------------- install
@@ -209,15 +284,16 @@ do_install() {
 	if [ -z "$project_id" ] && [ -n "$known" ]; then
 		project_id=$(jq -r '.projectId // empty' <<<"$known")
 	fi
-	if [ -z "$project_id" ]; then
-		project_id=$(cf_resolve_slug "$name" || true)
+	if [ -z "$project_id" ] && cf_resolve_slug "$name"; then
+		project_id=$CF_RESULT
 	fi
 	if [ -z "$project_id" ]; then
+		local why="CurseForge blocks slug lookups without an API key"
+		[ -n "$CURSEFORGE_API_KEY" ] && why="slug lookup failed - $CF_ERR"
 		die "don't know the project id for '$name'.
-  CurseForge blocks slug lookups without an API key, so pass it once:
+  $why, so pass it once:
       wowadd install $name --project-id <id>
-  The id is on the project page under 'About Project'. It is remembered afterwards.
-  Alternatively set CURSEFORGE_API_KEY to resolve slugs automatically."
+  The id is on the project page under 'About Project'. It is remembered afterwards."
 	fi
 
 	info "installing $name (curseforge project $project_id)"
@@ -305,8 +381,8 @@ do_list() {
 		entry=$(mf_get "$name")
 		local src ver first iface folders
 		src=$(jq -r '.source' <<<"$entry")
-		folders=$(jq -r '.folders | join(",")' <<<"$entry")
-		first=$(jq -r '.folders[0]' <<<"$entry")
+		folders=$(jq -r '(.folders // []) | join(",")' <<<"$entry")
+		first=$(jq -r '.folders[0] // empty' <<<"$entry")
 		ver=$(toc_version "$ADDONS_DIR/$first" 2>/dev/null || true)
 		[ -n "$ver" ] || ver=$(jq -r '.version' <<<"$entry")
 		iface=$(toc_interface "$ADDONS_DIR/$first" 2>/dev/null || true)
@@ -316,7 +392,7 @@ do_list() {
 
 	# Anything in AddOns that wowadd didn't put there.
 	local owned unmanaged=() d
-	owned=$(jq -r '.addons[].folders[]' "$MANIFEST" 2>/dev/null | sort -u)
+	owned=$(jq -r '.addons[] | (.folders // [])[]' "$MANIFEST" 2>/dev/null | sort -u)
 	for d in "$ADDONS_DIR"/*/; do
 		[ -d "$d" ] || continue
 		d=$(basename "$d")
@@ -325,6 +401,170 @@ do_list() {
 	if [ ${#unmanaged[@]} -gt 0 ]; then
 		printf '\n%sunmanaged (installed by hand):%s %s\n' "$C_DIM" "$C_OFF" "${unmanaged[*]}"
 	fi
+}
+
+# ---------------------------------------------------------------- remove
+
+confirm() { # prompt -> 0 if the user said yes
+	local reply
+	[ -t 0 ] || die "not a terminal, so nothing was confirmed - pass --yes to remove non-interactively"
+	printf '  %s [y/N] ' "$*"
+	read -r reply || return 1
+	[[ $reply == [yY] || $reply == [yY][eE][sS] ]]
+}
+
+do_remove() {
+	local yes=0 dry=0 backup=1 keep=0 targets=()
+	while [ $# -gt 0 ]; do
+		case $1 in
+			--yes|-y)     yes=1; shift ;;
+			--dry-run|-n) dry=1; shift ;;
+			--no-backup)  backup=0; shift ;;
+			--keep-files) keep=1; shift ;;
+			-*) die "unknown flag: $1" ;;
+			*)  targets+=("$1"); shift ;;
+		esac
+	done
+	[ ${#targets[@]} -gt 0 ] \
+		|| die "usage: wowadd remove <name>... [--dry-run] [--yes] [--no-backup] [--keep-files]"
+
+	local name entry f
+	for name in "${targets[@]}"; do
+		entry=$(mf_get "$name")
+		if [ -z "$entry" ]; then
+			warn "$name is not managed by wowadd (see: wowadd list)"
+			continue
+		fi
+
+		local folders=()
+		while IFS= read -r f; do [ -n "$f" ] && folders+=("$f"); done \
+			< <(jq -r '.folders[]? // empty' <<<"$entry")
+
+		info "removing $name ($(jq -r '.source' <<<"$entry"), $(jq -r '.version // "?"' <<<"$entry"))"
+
+		# A folder another managed addon also claims is never deleted - two addons
+		# sharing an embedded library would otherwise break the one left behind.
+		local mine=() others
+		for f in "${folders[@]}"; do
+			others=$(mf_other_owners "$name" "$f")
+			if [ -n "$others" ]; then
+				warn "$f is also used by $others - leaving it in place"
+			else
+				mine+=("$f")
+			fi
+		done
+
+		if [ "$keep" -eq 1 ]; then
+			if [ "$dry" -eq 1 ]; then
+				step "would forget $name, keeping ${#folders[@]} folder(s) on disk"
+				continue
+			fi
+			mf_del "$name"
+			ok "forgot $name - its folders are still installed"
+			continue
+		fi
+
+		local gone=() present=()
+		for f in "${mine[@]}"; do
+			if [ -d "$ADDONS_DIR/$f" ]; then present+=("$f"); else gone+=("$f"); fi
+		done
+		[ ${#present[@]} -gt 0 ] && step "delete: ${present[*]}"
+		[ ${#gone[@]} -gt 0 ] && step "already gone: ${gone[*]}"
+
+		if [ "$dry" -eq 1 ]; then
+			step "(dry run - nothing changed)"
+			continue
+		fi
+
+		if [ "$yes" -eq 0 ] && ! confirm "delete ${#present[@]} folder(s) and forget $name?"; then
+			step "skipped $name"
+			continue
+		fi
+
+		if [ "$backup" -eq 1 ] && [ ${#present[@]} -gt 0 ]; then
+			backup_folders "$name" "${present[@]}"
+		fi
+		for f in "${present[@]}"; do
+			rm -rf "${ADDONS_DIR:?}/$f"
+		done
+		mf_del "$name"
+		ok "removed $name"
+	done
+	return 0
+}
+
+# ---------------------------------------------------------------- search
+
+do_search() {
+	local limit=10 all=0 terms=()
+	while [ $# -gt 0 ]; do
+		case $1 in
+			--limit|-l) limit=$2; shift 2 ;;
+			--all|-a)   all=1; shift ;;
+			-*) die "unknown flag: $1" ;;
+			*)  terms+=("$1"); shift ;;
+		esac
+	done
+	[ ${#terms[@]} -gt 0 ] || die "usage: wowadd search <terms...> [--limit N] [--all]"
+	[[ $limit =~ ^[0-9]+$ ]] && [ "$limit" -gt 0 ] || die "--limit wants a positive number"
+
+	local query="${terms[*]}" found=0 rows
+
+	# CurseForge needs the official API; the open www endpoints answer 403 to search.
+	info "curseforge"
+	if [ -z "$CURSEFORGE_API_KEY" ]; then
+		step "${C_DIM}no CURSEFORGE_API_KEY - search needs one (free from console.curseforge.com)${C_OFF}"
+	else
+		local hits
+		if ! cf_search "$query" "$limit"; then
+			warn "no curseforge results - $CF_ERR"
+		else
+			hits=$CF_RESULT
+			# Only builds for our flavour, unless --all.
+			rows=$(jq -r --arg gv "$GAME_VERSION" --argjson all "$all" '
+				.[]
+				| ((.latestFilesIndexes // []) | map(.gameVersion) | index($gv) != null) as $fits
+				| select($all == 1 or $fits)
+				| [ (.name | .[0:30]), (.id | tostring), (.slug | .[0:24]),
+				    (.downloadCount | floor | tostring), (if $fits then "yes" else "-" end) ]
+				| @tsv
+			' <<<"$hits")
+			if [ -z "$rows" ]; then
+				step "no matches$([ "$all" -eq 0 ] && printf ' for %s (try --all)' "$GAME_VERSION")"
+			else
+				found=1
+				printf '  %-30s %-9s %-24s %10s %s\n' NAME ID SLUG DOWNLOADS "$GAME_VERSION"
+				while IFS=$'\t' read -r n i s d c; do
+					printf '  %-30s %-9s %-24s %10s %s\n' "$n" "$i" "$s" "$d" "$c"
+				done <<<"$rows"
+				step "${C_DIM}install: wowadd install <slug> --project-id <id>${C_OFF}"
+			fi
+		fi
+	fi
+
+	info "github"
+	local repos
+	if ! repos=$(gh_search "$query" "$limit"); then
+		warn "github search failed (network, or the rate limit was hit)"
+	else
+		rows=$(jq -r '
+			.[] | [ (.full_name | .[0:34]), (.stargazers_count | tostring),
+			        ((.description // "") | gsub("\\s+"; " ") | .[0:46]) ] | @tsv
+		' <<<"$repos")
+		if [ -z "$rows" ]; then
+			step "no matches"
+		else
+			found=1
+			printf '  %-34s %7s  %s\n' REPO STARS DESCRIPTION
+			while IFS=$'\t' read -r r s d; do
+				printf '  %-34s %7s  %s\n' "$r" "$s" "$d"
+			done <<<"$rows"
+			step "${C_DIM}install: wowadd install github:<owner/repo>${C_OFF}"
+		fi
+	fi
+
+	[ "$found" -eq 1 ] || return 1
+	return 0
 }
 
 # ---------------------------------------------------------------- update
@@ -415,11 +655,19 @@ wowadd $VERSION - install and update WoW addons
   wowadd install <curseforge-url>           slug (and file id) read from the URL
   wowadd install <slug> --file <fileId>     a specific build, e.g. to downgrade
   wowadd install github:owner/repo[@tag]    from GitHub releases
+  wowadd search <terms...>                  find addons on CurseForge and GitHub
   wowadd list                               what's installed, managed or not
   wowadd update [name...] [--dry-run]       check for and apply newer builds
+  wowadd remove <name...>                   delete an addon and forget it
   wowadd config-init <AddOns dir>           write the config file
 
 Flags for install: --stable-only (release only), --alpha (allow alpha).
+Flags for search:  --limit N (default 10), --all (any game version).
+Flags for remove:  --yes (no prompt), --dry-run, --no-backup,
+                   --keep-files (stop managing it, leave the folders).
+
+CurseForge search needs a CURSEFORGE_API_KEY approved for /v1/mods/search;
+GitHub search needs nothing, though GITHUB_TOKEN raises the rate limit.
 
 Config: $CONFIG
   ADDONS_DIR, GAME_VERSION (default 1.60.1), GAME_INTERFACE (default 16001),
@@ -438,6 +686,8 @@ case $cmd in
 	install)     init; do_install "$@" ;;
 	list|ls)     init; do_list "$@" ;;
 	update|up)   init; do_update "$@" ;;
+	remove|uninstall|rm) init; do_remove "$@" ;;
+	search|find) need curl; need jq; do_search "$@" ;;
 	config-init) do_config_init "$@" ;;
 	version|--version) printf 'wowadd %s\n' "$VERSION" ;;
 	help|--help|-h|"") usage ;;
